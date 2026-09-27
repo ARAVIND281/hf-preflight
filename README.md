@@ -87,10 +87,35 @@ merely needs approval.
 
 A token is read from `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
 `HUGGINGFACEHUB_API_TOKEN`, or `~/.cache/huggingface/token` — so if you have run
-`huggingface-cli login` there is nothing to do.
+`hf auth login` there is nothing to do.
 
-Note that reading a gated repo's metadata does **not** prove you may download
-its weights, and the output says so rather than implying access is confirmed.
+### The token is verified, not assumed
+
+For a gated repo the token is checked against the Hub before the report says
+anything about it, because **having a token and having a working one are
+different facts**. The Hub serves a repo's metadata identically to a valid
+bearer, an expired one and no bearer at all — same `200`, same body — so a stale
+token in `~/.cache/huggingface/token` looks exactly like a good one to any check
+that only asks whether a token is present.
+
+So the report distinguishes them, and `--json` carries the answer as
+`token_state`:
+
+| `token_state` | Meaning | Gated repo verdict |
+|---|---|---|
+| `valid` | the Hub accepted it (`token_name` is who you are) | `risky` — you still need the licence or approval |
+| `invalid` | the Hub rejected it: expired, revoked or malformed | `blocked` — run `hf auth login --force` |
+| `unverified` | the check itself could not be completed | `risky` — no claim either way |
+| `absent` | no token found | `blocked` — nothing will download |
+| `unchecked` | a token exists but the repo is not gated, so it changes nothing | n/a |
+
+That check costs one extra request and is only made where the answer changes a
+finding: a gated repo, or a refusal about to be explained. An `invalid` token
+also changes the *advice* on a refusal — being told to request access is useless
+when the credential is the thing that is broken.
+
+Note that a `valid` token does **not** prove you may download the weights, and
+the output says so rather than implying access is confirmed.
 
 ## What it does not do
 

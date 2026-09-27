@@ -18,6 +18,13 @@ all four are currently learned the hard way:
      unpickling executes whatever the pickle says to. ``.safetensors`` exists
      precisely so this is not true.
 
+A fifth thing turns out to matter as much as any of them: **does the token you
+have actually work?** The Hub answers a public metadata request identically for
+a valid bearer, an expired one and no bearer at all — same 200, same body — so
+"a token was found on disk" is not evidence of anything. For a gated repo the
+token is therefore verified against ``whoami-v2`` before the report claims it
+can read anything; see :class:`TokenStatus`.
+
 Only the public Hub API is used, through :mod:`urllib`, so there are no runtime
 dependencies and no dependency on ``huggingface_hub`` being installed.
 """
@@ -31,9 +38,19 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-__all__ = ["Finding", "Report", "inspect_model", "HubError", "SEVERITIES"]
+__all__ = [
+    "Finding",
+    "Report",
+    "TokenStatus",
+    "inspect_model",
+    "HubError",
+    "SEVERITIES",
+    "TOKEN_STATES",
+]
 
 _API = "https://huggingface.co/api/models"
+# The cheapest question that distinguishes "I have a token" from "my token works".
+_WHOAMI = "https://huggingface.co/api/whoami-v2"
 
 # Weight formats that execute code when loaded. safetensors was introduced to
 # avoid exactly this, so a repo offering only pickles is a deliberate signal.
@@ -58,6 +75,23 @@ _RESTRICTIVE = {
 
 SEVERITIES = ("clean", "risky", "blocked")
 
+# What we know about the token we found. "unchecked" is not ignorance we are
+# hiding: for an ungated repo the token's validity changes no finding, and
+# spending a request to establish it anyway would be a cost with no answer
+# attached.
+TOKEN_ABSENT = "absent"
+TOKEN_UNCHECKED = "unchecked"
+TOKEN_INVALID = "invalid"
+TOKEN_UNVERIFIED = "unverified"
+TOKEN_VALID = "valid"
+TOKEN_STATES = (
+    TOKEN_ABSENT,
+    TOKEN_UNCHECKED,
+    TOKEN_INVALID,
+    TOKEN_UNVERIFIED,
+    TOKEN_VALID,
+)
+
 
 class HubError(RuntimeError):
     """The Hub could not be reached, or refused the request."""
@@ -76,6 +110,33 @@ class Finding:
 
 
 @dataclass
+class TokenStatus:
+    """Whether the token we found is one the Hub actually accepts.
+
+    The distinction this type exists to keep is between *having* a token and
+    *having a working one*. An expired or revoked token is still a string in
+    ``~/.cache/huggingface/token``, and the Hub serves a public repo's metadata
+    to an invalid bearer exactly as it does to an anonymous caller — same 200,
+    same body. So a report that infers "authenticated" from "a token was found"
+    will tell you your token can read a gated repo at the moment the Hub is in
+    fact rejecting it, which is the one reading that costs a download.
+    """
+
+    state: str
+    name: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        """True only when the Hub confirmed the token. Unverified is not a yes."""
+        return self.state == TOKEN_VALID
+
+    @property
+    def phrase(self) -> str:
+        """How to refer to the token in a sentence, naming the user if known."""
+        return f"your token ({self.name})" if self.name else "your token"
+
+
+@dataclass
 class Report:
     """Everything learned about a model repository."""
 
@@ -86,6 +147,7 @@ class Report:
     weight_format: str = "unknown"
     license: str | None = None
     gated: str | None = None
+    token: TokenStatus = field(default_factory=lambda: TokenStatus(TOKEN_UNCHECKED))
 
     @property
     def severity(self) -> str:
@@ -129,6 +191,73 @@ def _token() -> str | None:
     return None
 
 
+def _check_token(token: str | None) -> TokenStatus:
+    """Ask the Hub whether ``token`` is accepted, and as whom.
+
+    One extra request, and only made where the answer changes what we say: a
+    gated repo, or a refusal we are about to explain. ``whoami-v2`` is the right
+    endpoint because it is the only one that *must* authenticate — a repo
+    endpoint answers 200 for a public repo whatever the bearer says, so it
+    cannot be used to test a token.
+    """
+    if not token:
+        return TokenStatus(TOKEN_ABSENT)
+    request = urllib.request.Request(_WHOAMI)
+    request.add_header("User-Agent", "hf-preflight")
+    request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # 401/403 from whoami is the Hub saying the credential itself is no
+        # good. Anything else is the Hub having a bad day, which is not a
+        # verdict on the token.
+        if exc.code in (401, 403):
+            return TokenStatus(TOKEN_INVALID)
+        return TokenStatus(TOKEN_UNVERIFIED)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        # Could not ask. Reporting "invalid" on a flaky connection would send
+        # someone off to replace a token that was fine.
+        return TokenStatus(TOKEN_UNVERIFIED)
+    if not isinstance(payload, dict):
+        return TokenStatus(TOKEN_UNVERIFIED)
+    name = payload.get("name") or payload.get("fullname")
+    return TokenStatus(TOKEN_VALID, name=str(name) if name else None)
+
+
+def _access_error(repo_hint: str, token: str | None) -> str:
+    """Explain a 401/403/404, resolving which of three things is actually wrong.
+
+    The Hub deliberately does not distinguish "does not exist" from "you may not
+    see it", so all three codes arrive here looking identical. What we *can*
+    settle is whether the token is the problem, and the three cases need
+    different actions from the reader: get a token, replace a broken one, or go
+    request access. Telling someone whose token has expired to request access is
+    advice that cannot work.
+    """
+    if token is None:
+        return (
+            f"{repo_hint} not found — check the id, or set HF_TOKEN if it is "
+            "private or gated"
+        )
+    status = _check_token(token)
+    if status.state == TOKEN_INVALID:
+        return (
+            f"the token you have is not valid — the Hub rejected it, so "
+            f"{repo_hint} cannot be read whether or not you have access to it. "
+            "Run `hf auth login --force` to replace it, then try again"
+        )
+    if status.state == TOKEN_UNVERIFIED:
+        return (
+            f"{repo_hint} not found, or your token does not have access to it "
+            "(the token could not be verified — the Hub did not answer the check)"
+        )
+    return (
+        f"{repo_hint} not found, or {status.phrase} does not have access to it "
+        "(gated repos need access granted, not just a valid token)"
+    )
+
+
 def _get(path: str, *, repo_hint: str = "that model") -> dict:
     """GET a Hub API path, following the redirect legacy ids produce.
 
@@ -144,20 +273,11 @@ def _get(path: str, *, repo_hint: str = "that model") -> dict:
         with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        # The Hub deliberately does not distinguish "does not exist" from "you
-        # may not see it", so 401/403/404 all mean the same thing to us. What
-        # changes is the useful advice, and telling someone who already has a
-        # token to set one is worse than saying nothing.
+        # 401/403/404 all mean "no data for you" and the Hub will not say which.
+        # _access_error spends one more request to work out whether the token is
+        # the reason, because the remedy differs completely.
         if exc.code in (401, 403, 404):
-            if token:
-                raise HubError(
-                    f"{repo_hint} not found, or your token does not have access "
-                    "to it (gated repos need access granted, not just a token)"
-                ) from exc
-            raise HubError(
-                f"{repo_hint} not found — check the id, or set HF_TOKEN if it is "
-                "private or gated"
-            ) from exc
+            raise HubError(_access_error(repo_hint, token)) from exc
         raise HubError(f"the Hub returned {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise HubError(f"could not reach huggingface.co: {exc.reason}") from exc
@@ -173,21 +293,40 @@ def human_bytes(count: int) -> str:
     return f"{size:.1f} TB"
 
 
-def _gated_finding(meta: dict, authenticated: bool) -> Finding:
-    """Gated repos are the most common wasted download."""
+def _gated_finding(meta: dict, token: TokenStatus) -> Finding:
+    """Gated repos are the most common wasted download.
+
+    The metadata coming back proves nothing about the token: the Hub serves a
+    gated repo's *card* to anyone. So what is said here turns on whether the Hub
+    confirmed the credential, not on whether one was found on disk.
+    """
     gated = meta.get("gated")
     if not gated:
         return Finding("gated", "clean", "gated: no")
     how = "accept the licence" if gated == "auto" else "request access and be approved"
-    if authenticated:
-        # The metadata came back, so the token can at least see the repo. That
-        # is not proof it may download weights, and saying so is more honest
-        # than implying access is confirmed.
+    if token.state == TOKEN_VALID:
+        # A confirmed token still does not prove you may download weights, so
+        # this stays "risky" rather than claiming access.
         return Finding(
             "gated",
             "risky",
-            f"gated: {gated} — your token can read the repo, but you must {how} "
-            "before the weights will download",
+            f"gated: {gated} — {token.phrase} is valid and can read the repo, "
+            f"but you must {how} before the weights will download",
+        )
+    if token.state == TOKEN_INVALID:
+        # Nothing will download, and the reason is not the gate.
+        return Finding(
+            "gated",
+            "blocked",
+            f"gated: {gated} — you must {how}, and the token you have is not "
+            "valid: the Hub rejected it, so run `hf auth login --force`",
+        )
+    if token.state == TOKEN_UNVERIFIED:
+        return Finding(
+            "gated",
+            "risky",
+            f"gated: {gated} — you must {how} before the weights will download; "
+            "your token could not be verified (the Hub did not answer the check)",
         )
     return Finding(
         "gated",
@@ -302,7 +441,14 @@ def inspect_model(repo_id: str, *, revision: str | None = None) -> Report:
     if meta.get("private"):
         report.findings.append(Finding("status", "risky", "the repository is private"))
 
-    report.findings.append(_gated_finding(meta, authenticated=_token() is not None))
+    # Only worth a request when the repo is gated; for an open repo the token's
+    # validity changes no finding here.
+    report.token = (
+        _check_token(_token())
+        if report.gated
+        else TokenStatus(TOKEN_ABSENT if _token() is None else TOKEN_UNCHECKED)
+    )
+    report.findings.append(_gated_finding(meta, report.token))
     report.findings.append(_license_finding(meta))
 
     siblings = meta.get("siblings") or []

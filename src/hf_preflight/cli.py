@@ -68,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
             "resolved_id": report.resolved_id,
             "severity": report.severity,
             "gated": report.gated,
+            "token_state": report.token.state,
+            "token_name": report.token.name,
             "license": report.license,
             "total_bytes": report.total_bytes,
             "total_human": human_bytes(report.total_bytes),
