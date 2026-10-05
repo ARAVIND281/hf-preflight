@@ -524,3 +524,102 @@ def test_json_carries_the_token_state(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["token_state"] == "valid"
     assert payload["token_name"] == "ARAVIND281"
+
+
+# --------------------------------------------------------------------------
+# dataset and space repositories
+#
+# The Hub serves three sibling endpoints that answer the same shape, but the
+# inspector only ever asked /api/models. A real dataset id therefore came back
+# 401 from the models endpoint and was reported as "not found" — the one
+# wrong answer worse than no answer, because the repo does exist.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("reference", "expected"),
+    [
+        ("org/name", ("org/name", None)),
+        ("  org/name  ", ("org/name", None)),
+        ("https://huggingface.co/org/name", ("org/name", "model")),
+        ("https://huggingface.co/datasets/org/name", ("org/name", "dataset")),
+        ("http://huggingface.co/datasets/org/name", ("org/name", "dataset")),
+        ("huggingface.co/datasets/org/name", ("org/name", "dataset")),
+        ("https://huggingface.co/spaces/org/name", ("org/name", "space")),
+        ("https://huggingface.co/datasets/org/name/tree/main", ("org/name", "dataset")),
+    ],
+)
+def test_split_repo_type_reads_the_kind_out_of_a_url(reference, expected):
+    assert core.split_repo_type(reference) == expected
+
+
+def test_a_bare_datasets_prefix_is_not_read_as_a_kind():
+    """``datasets/squad`` is ambiguous with an org literally called
+    ``datasets``, so only a real URL is read for its kind."""
+    assert core.split_repo_type("datasets/squad") == ("datasets/squad", None)
+
+
+def test_the_requested_kind_picks_the_endpoint(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        raise core.urllib.error.URLError("stop here")
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core, "_token", lambda: None)
+    with pytest.raises(core.HubError):
+        core.inspect_model("org/name", repo_type="dataset")
+    assert "/api/datasets/org/name" in seen["url"]
+
+
+def test_a_url_kind_beats_the_passed_kind(monkeypatch):
+    """Pasting a dataset URL must not need a second flag that agrees with it,
+    and must not be silently inspected as a model."""
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        raise core.urllib.error.URLError("stop here")
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core, "_token", lambda: None)
+    with pytest.raises(core.HubError):
+        core.inspect_model("https://huggingface.co/datasets/org/name", repo_type="model")
+    assert "/api/datasets/org/name" in seen["url"]
+
+
+def test_the_default_kind_is_still_model(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        raise core.urllib.error.URLError("stop here")
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core, "_token", lambda: None)
+    with pytest.raises(core.HubError):
+        core.inspect_model("org/name")
+    assert "/api/models/org/name" in seen["url"]
+
+
+def test_an_unknown_kind_is_refused_rather_than_guessed():
+    with pytest.raises(ValueError, match="repo_type must be one of"):
+        core.inspect_model("org/name", repo_type="notebook")
+
+
+def test_the_report_and_json_name_the_kind(monkeypatch, capsys):
+    _stub(monkeypatch, _meta(siblings=[{"rfilename": "data.parquet", "size": 10}]))
+    report = core.inspect_model("org/name", repo_type="dataset")
+    assert report.repo_type == "dataset"
+
+    main(["org/name", "--type", "dataset", "--json"])
+    assert json.loads(capsys.readouterr().out)["repo_type"] == "dataset"
+
+
+def test_the_human_output_labels_a_non_model_and_leaves_models_unlabelled(monkeypatch, capsys):
+    _stub(monkeypatch)
+    main(["org/name", "--type", "dataset", "--no-colour"])
+    assert "[dataset]" in capsys.readouterr().out
+
+    _stub(monkeypatch)
+    main(["org/name", "--no-colour"])
+    assert "[model]" not in capsys.readouterr().out

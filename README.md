@@ -66,6 +66,26 @@ hf-preflight org/model --revision refs/pr/3
 hf-preflight org/model --json
 ```
 
+### Datasets and spaces
+
+The Hub serves models, datasets and spaces from three sibling endpoints that
+answer the same shape, so one inspector covers all three:
+
+```bash
+hf-preflight stanfordnlp/imdb --type dataset
+hf-preflight https://huggingface.co/datasets/stanfordnlp/imdb   # kind read from the URL
+hf-preflight https://huggingface.co/spaces/org/demo
+```
+
+A pasted URL names its own kind, and that wins over `--type` — a dataset URL
+should not need a flag that agrees with it, and must not be quietly inspected
+as a model. `--type` defaults to `model`, so every existing invocation is
+unchanged, and the kind appears in the output and in `--json` as `repo_type`.
+
+Without this, a real dataset id sent to the models endpoint comes back `401`
+and was reported as **"not found"** — the one wrong answer worse than no
+answer, because the repository does exist.
+
 Exit codes: `0` clean, `1` risky, `2` blocked, `3` error.
 
 For CI, name the gates you actually care about — this exits non-zero **only**

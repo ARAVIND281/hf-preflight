@@ -46,9 +46,16 @@ __all__ = [
     "HubError",
     "SEVERITIES",
     "TOKEN_STATES",
+    "REPO_TYPES",
+    "split_repo_type",
 ]
 
-_API = "https://huggingface.co/api/models"
+_API_BASE = "https://huggingface.co/api"
+
+#: Repository kinds the Hub serves. The three live under sibling endpoints
+#: (``/api/models``, ``/api/datasets``, ``/api/spaces``) that answer the same
+#: shape, so one inspector covers all three.
+REPO_TYPES = ("model", "dataset", "space")
 # The cheapest question that distinguishes "I have a token" from "my token works".
 _WHOAMI = "https://huggingface.co/api/whoami-v2"
 
@@ -147,6 +154,7 @@ class Report:
     weight_format: str = "unknown"
     license: str | None = None
     gated: str | None = None
+    repo_type: str = "model"
     token: TokenStatus = field(default_factory=lambda: TokenStatus(TOKEN_UNCHECKED))
 
     @property
@@ -258,13 +266,13 @@ def _access_error(repo_hint: str, token: str | None) -> str:
     )
 
 
-def _get(path: str, *, repo_hint: str = "that model") -> dict:
+def _get(path: str, *, repo_hint: str = "that model", repo_type: str = "model") -> dict:
     """GET a Hub API path, following the redirect legacy ids produce.
 
     ``bert-base-uncased`` now 307s to ``google-bert/bert-base-uncased``; without
     following it the response body is the redirect notice, not JSON.
     """
-    request = urllib.request.Request(f"{_API}/{path}")
+    request = urllib.request.Request(f"{_API_BASE}/{repo_type}s/{path}")
     request.add_header("User-Agent", "hf-preflight")
     token = _token()
     if token:
@@ -410,25 +418,37 @@ def _weight_findings(files: list[str]) -> tuple[Finding, str]:
     return Finding("pickle", "clean", "weights: no weight files found"), "none"
 
 
-def inspect_model(repo_id: str, *, revision: str | None = None) -> Report:
+def inspect_model(
+    repo_id: str, *, revision: str | None = None, repo_type: str = "model"
+) -> Report:
     """Gather everything worth knowing before downloading ``repo_id``.
 
     Args:
         repo_id: ``org/name``, or a legacy bare name, or a huggingface.co URL.
         revision: branch, tag or commit. Defaults to the repo's default branch.
+        repo_type: ``model`` (default), ``dataset`` or ``space``. A
+            huggingface.co URL carries its own kind, which wins over this
+            argument - pasting a dataset URL should not need a second flag.
 
     Returns:
         A :class:`Report`. Its ``severity`` is the worst finding: ``clean``,
         ``risky`` (something executes code, or the licence is restrictive), or
         ``blocked`` (you cannot download it at all as configured).
     """
-    repo_id = normalise_repo_id(repo_id)
+    repo_id, detected = split_repo_type(repo_id)
+    repo_type = detected or repo_type
+    if repo_type not in REPO_TYPES:
+        raise ValueError(f"repo_type must be one of {', '.join(REPO_TYPES)}, got {repo_type!r}")
     path = urllib.parse.quote(repo_id, safe="/")
     if revision:
         path = f"{path}/revision/{urllib.parse.quote(revision, safe='')}"
-    meta = _get(f"{path}?blobs=true", repo_hint=repo_id)
+    meta = _get(f"{path}?blobs=true", repo_hint=repo_id, repo_type=repo_type)
 
-    report = Report(repo_id=repo_id, resolved_id=meta.get("id") or repo_id)
+    report = Report(
+        repo_id=repo_id,
+        resolved_id=meta.get("id") or repo_id,
+        repo_type=repo_type,
+    )
     report.gated = meta.get("gated") or None
     card = meta.get("cardData") or {}
     lic = card.get("license")
@@ -466,6 +486,28 @@ def inspect_model(repo_id: str, *, revision: str | None = None) -> Report:
     report.weight_format = fmt
     report.findings.append(weight_finding)
     return report
+
+
+def split_repo_type(raw: str) -> tuple[str, str | None]:
+    """Split a reference into ``(repo_id, repo_type or None)``.
+
+    A Hub URL names the kind in its path - ``huggingface.co/datasets/<id>``,
+    ``huggingface.co/spaces/<id>`` - while a model URL has no such segment.
+    Reading it is what lets a pasted dataset URL work without also passing a
+    flag that contradicts it. ``None`` means the reference said nothing, so the
+    caller's own default stands.
+    """
+    value = raw.strip()
+    for prefix in ("https://huggingface.co/", "http://huggingface.co/", "huggingface.co/"):
+        if value.startswith(prefix):
+            tail = value[len(prefix):]
+            for segment, kind in (("datasets/", "dataset"), ("spaces/", "space")):
+                if tail.startswith(segment):
+                    return normalise_repo_id(tail[len(segment):]), kind
+            return normalise_repo_id(tail), "model"
+    # A bare "datasets/squad" is ambiguous with an org called "datasets", so
+    # only a real URL is read for its kind.
+    return normalise_repo_id(value), None
 
 
 def normalise_repo_id(raw: str) -> str:
