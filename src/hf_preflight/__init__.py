@@ -9,7 +9,7 @@ from hf_preflight.core import (
     normalise_repo_id,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 __all__ = [
     "inspect_model",
     "normalise_repo_id",

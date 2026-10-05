@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hf-preflight"
-version = "0.1.1"
+version = "0.2.0"
 description = "Check a Hugging Face model before you download it — gated, licence, size, and whether loading it runs someone else's code"
 readme = "README.md"
 requires-python = ">=3.9"

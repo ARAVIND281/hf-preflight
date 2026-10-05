@@ -7,7 +7,7 @@ import json
 import sys
 
 from hf_preflight import __version__
-from hf_preflight.core import HubError, Report, human_bytes, inspect_model
+from hf_preflight.core import REPO_TYPES, HubError, Report, human_bytes, inspect_model
 
 _COLOUR = {"clean": "\033[32m", "risky": "\033[33m", "blocked": "\033[31m"}
 _OFF = "\033[0m"
@@ -26,7 +26,8 @@ def _render(report: Report, *, colour: bool) -> str:
     verdict = report.severity.upper()
     if colour:
         verdict = f"{_COLOUR.get(report.severity, '')}{verdict}{_OFF}"
-    lines = [verdict, f"  {report.resolved_id}"]
+    kind = "" if report.repo_type == "model" else f"  [{report.repo_type}]"
+    lines = [verdict, f"  {report.resolved_id}{kind}"]
     if report.resolved_id != report.repo_id:
         lines[-1] += f"   (you asked for {report.repo_id})"
     lines.append("")
@@ -44,6 +45,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("model", help="org/name, or a huggingface.co URL")
     parser.add_argument("--revision", metavar="REF", help="branch, tag or commit")
     parser.add_argument(
+        "--type",
+        dest="repo_type",
+        choices=REPO_TYPES,
+        default="model",
+        help="repository kind (default: model). A huggingface.co URL that names "
+             "its own kind overrides this.",
+    )
+    parser.add_argument(
         "--fail-on",
         metavar="LIST",
         help=(
@@ -57,7 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        report = inspect_model(args.model, revision=args.revision)
+        report = inspect_model(
+            args.model, revision=args.revision, repo_type=args.repo_type
+        )
     except (ValueError, HubError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
@@ -68,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             "resolved_id": report.resolved_id,
             "severity": report.severity,
             "gated": report.gated,
+            "repo_type": report.repo_type,
             "token_state": report.token.state,
             "token_name": report.token.name,
             "license": report.license,
